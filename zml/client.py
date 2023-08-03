@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.asymmetric import dh
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.serialization import *
+import binascii as ba
+import socketserver
+import socket
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.hmac import HMAC
+from cryptography.hazmat.primitives import hashes
+import argparse
+import pdb
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='Client')
+    parser.add_argument('--host', type=str, help='Server IP address')
+    parser.add_argument('--port', type=int, help='Server port number')
+    parser.add_argument('--mode', type=int, help='Connection mode: 1 Talk, 2 Transport File, 3 Scan')
+    parser.add_argument('--startport', type=int, help='Start port for scanning', required=False)
+    parser.add_argument('--endport', type=int, help='End port for scanning', required=False)
+    return parser.parse_args()
+
+
+def encrypt_file(key, iv, file_path, output_path):
+    cipher = Cipher(algorithms.TripleDES(key), modes.CFB(iv), default_backend())
+    encryptor = cipher.encryptor()
+    with open(file_path, 'rb') as f:
+        file_data = f.read()
+    encrypted_data = encryptor.update(file_data) + encryptor.finalize()
+    with open(output_path, 'wb') as f:
+        f.write(encrypted_data)
+
+def decrypt_file(key, iv, file_path, output_path):
+    cipher = Cipher(algorithms.TripleDES(key), modes.CFB(iv), default_backend())
+    decryptor = cipher.decryptor()
+    with open(file_path, 'rb') as f:
+        encrypted_data = f.read()
+    decrypted_data = decryptor.update(encrypted_data) + decryptor.finalize()
+    with open(output_path, 'wb') as f:
+        f.write(decrypted_data)
+
+def encrypt_message(key, iv, message):
+    cipher = Cipher(algorithms.TripleDES(key), modes.CFB(iv), default_backend())
+    encryptor = cipher.encryptor()
+    encrypted_message = encryptor.update(message) + encryptor.finalize()
+    return encrypted_message
+
+def decrypt_message(key, iv, encrypted_message):
+    cipher = Cipher(algorithms.TripleDES(key), modes.CFB(iv), default_backend())
+    decryptor = cipher.decryptor()
+    decrypted_message = decryptor.update(encrypted_message) + decryptor.finalize()
+    return decrypted_message
+
+
+def gen_hmac(key, message):
+    hmac = HMAC(key, hashes.SHA256())
+    hmac.update(message)
+    return hmac.finalize()
+
+def v_hmac(key, message, rec_hmac):
+    hmac = HMAC(key, hashes.SHA256())
+    hmac.update(message)
+    try:
+        hmac.verify(rec_hmac)
+        return True
+    except InvalidSignature:
+        return False
+
+def main():
+    args = parse_arguments()
+    host = args.host
+    port = args.port
+    mode = args.mode
+    start_port = args.startport
+    end_port = args.endport
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((host, port))
+    request = b'127.0.0.1'
+    sock.sendall(request)
+    received = sock.recv(3072).strip()
+    print('Received:\n{}'.format(received))
+    if received == b'Hey there!':
+        request = b'Params?'
+        sock.sendall(request)
+    else:
+        print('The device is not allowed to access the server')
+        sock.close()
+        return
+
+    received = sock.recv(3072).strip()
+    print('Received:\n{}'.format(received))
+    dh_params = load_pem_parameters(received, default_backend())
+    if isinstance(dh_params, dh.DHParameters):
+        client_keypair = dh_params.generate_private_key()
+        request = b'Client public key:' + client_keypair.public_key().public_bytes(
+            Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+        sock.sendall(request)
+    else:
+        print('Bad response')
+        sock.close()
+        return
+
+    received = sock.recv(3072).strip()
+    print('Received:\n{}'.format(received))
+    if bytearray(received)[0:18] == b'Server public key:':
+        server_pubkey = load_pem_public_key(bytes(bytearray(received)[18:]), default_backend())
+        if isinstance(server_pubkey, dh.DHPublicKey):
+            shared_secret = client_keypair.exchange(server_pubkey)
+            print('Shared Secret\n{}'.format(ba.hexlify(shared_secret)))
+            kdf = HKDF(
+                algorithm=hashes.SHA256(),
+                length=48,
+                salt=None,
+                info=b'Handshake data',
+                backend=default_backend()
+            )
+            key_material = kdf.derive(shared_secret)
+            key = key_material[:16]
+            mac_key = key_material[16:32]
+            request = b'Please give me the salt'
+            sock.sendall(request)
+
+    received = sock.recv(3072).strip()
+    print('Received:\n{}'.format(received))
+    salt_start = received.find(b'Server salt:') + len('Server salt:')
+    salt = received[salt_start:].strip()
+    
+    request = str(mode)
+    sock.sendall(request.encode())
+
+    if mode == 1:
+        while True:
+            message = input('Your message: ')
+            # pdb.set_trace()
+            encrypted_message = encrypt_message(key, salt, message.encode())
+            hmac = gen_hmac(mac_key, encrypted_message)
+            data = encrypted_message + hmac
+            sock.sendall(data)
+            print("Send successfully")
+            response = sock.recv(3072).strip()
+            received_message = response[:-32]
+            rec_hmac = response[-32:]
+            print('Received: {}'.format(response))
+            if v_hmac(mac_key, received_message, rec_hmac):
+                decrypted_message = decrypt_message(key, salt, received_message)
+                print('After decrypted message:\n{}'.format(decrypted_message.decode()))
+            else:
+                print('Message authentication failed')
+
+    elif mode == 2:
+        while True:
+            filename = input("Enter the filename: ")
+            with open(filename, 'rb') as f:
+                filedata = f.read()
+
+            encrypted_file = encrypt_message(key, salt, filedata)
+            hmac = gen_hmac(mac_key, encrypted_file)
+
+            sock.sendall(encrypted_file + hmac)
+            received = sock.recv(3072).strip()
+            print('Received:\n{}'.format(received))
+
+    elif mode == 3:
+        port_range = str(start_port) + '-' + str(end_port)  # 将 start_port 和 end_port 连接为一个字符串
+        sock.sendall(port_range.encode())  # 发送端口范围给服务器
+        received = sock.recv(3072).strip()
+        print('Received:\n{}'.format(received))
+
+
+if __name__ == '__main__':
+    main()
